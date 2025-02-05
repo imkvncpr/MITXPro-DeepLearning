@@ -3,299 +3,354 @@ import unicodedata
 import string
 import random
 import re
-import torch
-import torch.nn as nn
 import numpy as np
-import time, copy
-import matplotlib.pyplot as plt
+import pandas as pd
+import yfinance as yf
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from tensorflow import keras
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from scikeras.wrappers import KerasRegressor
+import plotly.graph_objects as go
+import logging
+from typing import Tuple, Dict, Optional, Union
 import os
-import requests
-import zipfile
-import io
 
-# Device configuration
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-def download_dataset():
-    url = "https://www.manythings.org/anki/spa-eng.zip"
-    
-    if not os.path.exists("spa.txt"):
-        print("Downloading Spanish-English dataset...")
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.get(url, headers=headers)
+class CryptoPricePredictor:
+    def __init__(self, 
+                 ticker: str = 'BTC-USD',
+                 look_back: int = 60,
+                 test_size: float = 0.2,
+                 random_state: int = 42):
+        """
+        Initialize the cryptocurrency price predictor.
         
-        if response.status_code == 200:
-            print("Download successful. Extracting files...")
-            z = zipfile.ZipFile(io.BytesIO(response.content))
-            z.extractall()
-            if os.path.exists("_about.txt"):
-                os.remove("_about.txt")
-            print("Dataset ready!")
-        else:
-            print(f"Failed to download. Status code: {response.status_code}")
-    else:
-        print("Dataset already exists!")
-
-def unicodeToAscii(s):
-    return ''.join(
-        c for c in unicodedata.normalize('NFD', s)
-        if unicodedata.category(c) != 'Mn'
-    )
-
-def normalizeString(s):
-    s = unicodeToAscii(s.lower().strip())
-    s = re.sub(r"([.!?])", r"", s)
-    s = re.sub(r"[^a-zA-Z.!'?]+", r" ", s)
-    return s
-
-def parse_data(filename):
-    lines = open(filename, encoding='utf-8').read().strip().split('\n')
-    pairs = [[normalizeString(s) for s in l.split('\t')] for l in lines]
-    pairs = [[pair[0], pair[1]] for pair in pairs]
-    return pairs
-
-def add_words_to_dict(word_dictionary, word_list, sentences):
-    for sentence in sentences:
-        for word in sentence.split(" "):
-            if word not in word_dictionary:
-                word_list.append(word)
-                word_dictionary[word] = len(word_list)-1
-
-def create_input_tensor(sentence, word_dictionary):
-    words = sentence.split(" ")
-    tensor = torch.zeros(len(words), 1, len(word_dictionary)+1)
-    for idx in range(len(words)):
-        word = words[idx]
-        if word in word_dictionary:
-            tensor[idx][0][word_dictionary[word]] = 1
-    return tensor
-
-def create_target_tensor(sentence, word_dictionary):
-    words = sentence.split(" ")
-    # Create tensor with proper dimensions for NLLLoss
-    tensor = torch.zeros(len(words), len(word_dictionary)+1)
-    for idx in range(1, len(words)):
-        word = words[idx]
-        if word in word_dictionary:
-            tensor[idx-1][word_dictionary[word]] = 1
-    tensor[len(words)-1][len(word_dictionary)] = 1  # EOS
-    return tensor
-
-def tensor_to_sentence(word_list, tensor):
-    sentence = ""
-    for i in range(tensor.size(0)):
-        topv, topi = tensor[i].topk(1)
-        if topi[0][0] == len(word_list):
-            sentence += "<EOS>"
-            break
-        sentence += word_list[topi[0][0]]
-        sentence += " "
-    return sentence
-
-class LSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(LSTM, self).__init__()
-        self.hidden_size = hidden_size
+        Args:
+            ticker: Trading symbol for the cryptocurrency
+            look_back: Number of previous time steps to use for prediction
+            test_size: Proportion of dataset to use for testing
+            random_state: Random seed for reproducibility
+        """
+        self.ticker = ticker
+        self.look_back = look_back
+        self.test_size = test_size
+        self.random_state = random_state
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+        self.model = None
+        self.X = None
         
-        # LSTM layer with 2 layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=2, batch_first=False)
+    def download_crypto_data(self, years: int = 5) -> Optional[pd.DataFrame]:
+        """
+        Download historical cryptocurrency data.
         
-        # Output layers
-        self.fc = nn.Linear(hidden_size, output_size)
-        self.softmax = nn.LogSoftmax(dim=1)
-    
-    def forward(self, input, hidden):
-        # Process through LSTM
-        output, hidden = self.lstm(input, hidden)
-        
-        # Pass through final layers
-        output = self.fc(output.view(-1, self.hidden_size))
-        output = self.softmax(output)
-        
-        return output, hidden
-    
-    def initHidden(self):
-        return (torch.zeros(2, 1, self.hidden_size).to(device),
-                torch.zeros(2, 1, self.hidden_size).to(device))
+        Args:
+            years: Number of years of historical data to download
+            
+        Returns:
+            DataFrame containing historical price data
+        """
+        try:
+            end_date = pd.Timestamp.now()
+            start_date = end_date - pd.DateOffset(years=years)
+            data = yf.download(self.ticker, start=start_date, end=end_date)
+            logger.info(f"Successfully downloaded {years} years of {self.ticker} data")
+            return data
+        except Exception as e:
+            logger.error(f"Error downloading data: {str(e)}")
+            return None
 
-def train_lstm(model, dataloaders, dataset_sizes, criterion, optimizer, scheduler, num_epochs=25):
-    since = time.time()
-    best_model_wts = copy.deepcopy(model.state_dict())
-    best_loss = float('inf')
-    best_epoch = 0
-    phases = ['train', 'val', 'test']
-    
-    training_curves = {phase+'_loss': [] for phase in phases}
-    
-    for epoch in range(num_epochs):
-        print(f'\nEpoch {epoch+1}/{num_epochs}')
-        print('-' * 10)
+    def prepare_data(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Prepare data for LSTM model training.
+        
+        Args:
+            data: Raw price data
+            
+        Returns:
+            Tuple of (X, y) arrays for model training
+        """
+        try:
+            # Use more features: Open, High, Low, Close, Volume
+            feature_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+            data_processed = data[feature_columns].values
+            
+            # Scale features independently
+            scaled_data = self.scaler.fit_transform(data_processed)
+            
+            X, y = [], []
+            for i in range(self.look_back, len(scaled_data)):
+                X.append(scaled_data[i-self.look_back:i])
+                y.append(scaled_data[i, 3])  # Index 3 corresponds to Close price
+            
+            X, y = np.array(X), np.array(y)
+            logger.info(f"Prepared data shapes: X: {X.shape}, y: {y.shape}")
+            return X, y
+        except Exception as e:
+            logger.error(f"Error preparing data: {str(e)}")
+            raise
 
-        for phase in phases:
-            if phase == 'train':
-                model.train()
+    def create_model(self, 
+                    neurons: int = 100,
+                    dropout: float = 0.3) -> Sequential:
+        """
+        Create LSTM model architecture.
+        
+        Args:
+            neurons: Number of LSTM units in first layer
+            dropout: Dropout rate for regularization
+            
+        Returns:
+            Compiled Keras Sequential model
+        """
+        try:
+            model = Sequential([
+                LSTM(neurons, return_sequences=True, 
+                     input_shape=(self.look_back, 5)),  # 5 features
+                Dropout(dropout),
+                LSTM(neurons//2, return_sequences=False),
+                Dropout(dropout/2),
+                Dense(25, activation='relu'),
+                Dense(1)
+            ])
+            model.compile(optimizer='adam', loss='mean_squared_error')
+            return model
+        except Exception as e:
+            logger.error(f"Error creating model: {str(e)}")
+            raise
+
+    def train_model(self,
+                   X: np.ndarray,
+                   y: np.ndarray,
+                   optimize_hyperparameters: bool = False,
+                   **kwargs) -> Tuple[Sequential, Dict[str, float]]:
+        """
+        Train the LSTM model with optional hyperparameter optimization.
+        
+        Args:
+            X: Input features
+            y: Target values
+            optimize_hyperparameters: Whether to perform hyperparameter tuning
+            **kwargs: Additional training parameters
+            
+        Returns:
+            Tuple of (trained model, training metrics)
+        """
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=self.test_size, random_state=self.random_state
+            )
+            
+            if optimize_hyperparameters:
+                model = self._optimize_hyperparameters(X_train, y_train)
             else:
-                model.eval()
-
-            running_loss = 0.0
-
-            for input_sequence, target_sequence in dataloaders[phase]:
-                hidden = model.initHidden()
+                model = self.create_model()
                 
-                current_input_sequence = input_sequence.to(device)
-                current_target_sequence = target_sequence.to(device)
+                # Add callbacks
+                callbacks = [
+                    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+                    ModelCheckpoint('best_model.h5', monitor='val_loss', save_best_only=True)
+                ]
                 
-                optimizer.zero_grad()
-
-                with torch.set_grad_enabled(phase == 'train'):
-                    loss = 0
-                    for i in range(current_input_sequence.size(0)):
-                        output, hidden = model(current_input_sequence[i:i+1], hidden)
-                        # Convert target to proper format for NLLLoss
-                        target = current_target_sequence[i].argmax(dim=0).unsqueeze(0)
-                        loss += criterion(output, target)
-
-                    if phase == 'train':
-                        loss.backward()
-                        optimizer.step()
-
-                running_loss += loss.item() / current_input_sequence.size(0)
+                model.fit(
+                    X_train, y_train,
+                    epochs=kwargs.get('epochs', 100),
+                    batch_size=kwargs.get('batch_size', 32),
+                    validation_split=0.2,
+                    callbacks=callbacks,
+                    verbose=1
+                )
             
-            if phase == 'train':
-                scheduler.step()
+            # Evaluate model
+            predictions = model.predict(X_test, verbose=0)
+            metrics = self._calculate_metrics(y_test, predictions)
+            
+            self.model = model
+            return model, metrics
+            
+        except Exception as e:
+            logger.error(f"Error training model: {str(e)}")
+            raise
 
-            epoch_loss = running_loss / dataset_sizes[phase]
-            training_curves[phase+'_loss'].append(epoch_loss)
+    def _optimize_hyperparameters(self, X_train: np.ndarray, y_train: np.ndarray) -> Sequential:
+        """
+        Perform hyperparameter optimization using RandomizedSearchCV.
+        """
+        model = KerasRegressor(model=self.create_model, verbose=0)
+        
+        param_dist = {
+            'model__neurons': [50, 100, 150, 200],
+            'model__dropout': [0.2, 0.3, 0.4, 0.5],
+            'batch_size': [16, 32, 64],
+            'epochs': [50, 100, 150]
+        }
+        
+        random_search = RandomizedSearchCV(
+            estimator=model,
+            param_distributions=param_dist,
+            n_iter=10,
+            cv=3,
+            verbose=2
+        )
+        
+        random_search.fit(X_train, y_train)
+        logger.info(f"Best hyperparameters: {random_search.best_params_}")
+        return random_search.best_estimator_.model_
 
-            print(f'{phase:5} Loss: {epoch_loss:.4f}')
+    def _calculate_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+        """
+        Calculate regression metrics.
+        """
+        # Inverse transform predictions to original scale
+        y_true_orig = self.scaler.inverse_transform(np.column_stack([np.zeros((len(y_true), 3)), 
+                                                                    y_true.reshape(-1, 1),
+                                                                    np.zeros((len(y_true), 1))]))[:, 3]
+        y_pred_orig = self.scaler.inverse_transform(np.column_stack([np.zeros((len(y_pred), 3)), 
+                                                                    y_pred.reshape(-1, 1),
+                                                                    np.zeros((len(y_pred), 1))]))[:, 3]
+        
+        return {
+            'MSE': mean_squared_error(y_true_orig, y_pred_orig),
+            'RMSE': np.sqrt(mean_squared_error(y_true_orig, y_pred_orig)),
+            'MAE': mean_absolute_error(y_true_orig, y_pred_orig),
+            'R2': r2_score(y_true_orig, y_pred_orig)
+        }
 
-            if phase == 'train' and epoch_loss < best_loss:
-                best_epoch = epoch
-                best_loss = epoch_loss
-                best_model_wts = copy.deepcopy(model.state_dict())
+    def visualize_predictions(self, y_true: np.ndarray, y_pred: np.ndarray) -> None:
+        """
+        Create interactive visualization of predictions vs actual values.
+        """
+        # Inverse transform the data
+        y_true_orig = self.scaler.inverse_transform(np.column_stack([np.zeros((len(y_true), 3)), 
+                                                                    y_true.reshape(-1, 1),
+                                                                    np.zeros((len(y_true), 1))]))[:, 3]
+        y_pred_orig = self.scaler.inverse_transform(np.column_stack([np.zeros((len(y_pred), 3)), 
+                                                                    y_pred.reshape(-1, 1),
+                                                                    np.zeros((len(y_pred), 1))]))[:, 3]
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(y=y_true_orig, mode='lines', name='Actual Prices'))
+        fig.add_trace(go.Scatter(y=y_pred_orig, mode='lines', name='Predicted Prices'))
+        fig.update_layout(
+            title=f'{self.ticker} Price Prediction',
+            xaxis_title='Time',
+            yaxis_title='Price',
+            template='plotly_dark'
+        )
+        fig.show()
 
-    time_elapsed = time.time() - since
-    print(f'\nTraining complete in {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s')
-    print(f'Best val Loss: {best_loss:4f} at epoch {best_epoch}')
+    # [Previous imports and class methods remain the same until predict_future...]
 
-    model.load_state_dict(best_model_wts)
-    return model, training_curves
+    def predict_future(self, days: int = 30) -> np.ndarray:
+        """
+        Predict future prices for a specified number of days.
+        
+        Args:
+            days: Number of days to predict into the future
+            
+        Returns:
+            Array of predicted prices
+        """
+        if self.model is None:
+            raise ValueError("Model must be trained before making predictions")
+            
+        try:
+            # Get the most recent data window
+            current_sequence = self.X[-1:].copy()  # Shape: (1, look_back, 5)
+            future_predictions = []
+            
+            for _ in range(days):
+                # Make prediction for next day
+                next_pred = self.model.predict(current_sequence, verbose=0)[0, 0]  # Get scalar value
+                future_predictions.append(next_pred)
+                
+                # Shift the sequence and update with new prediction
+                # Move all timesteps one step back
+                current_sequence = current_sequence.copy()
+                current_sequence[0, :-1] = current_sequence[0, 1:]
+                
+                # Create new timestep data
+                new_timestep = current_sequence[0, -1].copy()
+                new_timestep[3] = next_pred  # Update only the Close price
+                
+                # Update the last timestep
+                current_sequence[0, -1] = new_timestep
+                
+            # Convert predictions back to original scale
+            future_predictions = np.array(future_predictions).reshape(-1, 1)
+            future_predictions_reshaped = np.hstack([
+                np.zeros((len(future_predictions), 3)),  # Open, High, Low
+                future_predictions,                      # Close
+                np.zeros((len(future_predictions), 1))   # Volume
+            ])
+            
+            future_prices = self.scaler.inverse_transform(future_predictions_reshaped)[:, 3]
+            
+            logger.info(f"Generated {days} days of future predictions")
+            return future_prices
+            
+        except Exception as e:
+            logger.error(f"Error making future predictions: {str(e)}")
+            raise
 
-def predict(model, word_dictionary, word_list, input_sentence, max_length=20):
-    model.eval()
-    output_sentence = input_sentence + " "
-    tensor = create_input_tensor(input_sentence, word_dictionary)
-    hidden = model.initHidden()
+def main():
+    """
+    Main function to demonstrate the cryptocurrency price prediction pipeline.
+    """
+    # Initialize predictor
+    predictor = CryptoPricePredictor(ticker='BTC-USD', look_back=60)
     
-    with torch.no_grad():
-        # Process input sentence
-        for i in range(tensor.size(0)):
-            output, hidden = model(tensor[i:i+1].to(device), hidden)
-            
-        # Generate new words
-        current_length = len(input_sentence.split())
-        for _ in range(max_length - current_length):
-            topv, topi = output.topk(1)
-            word_idx = topi[0].item()
-            
-            if word_idx == len(word_dictionary):  # EOS token
-                break
-                
-            word = word_list[word_idx]
-            output_sentence += word + " "
-            
-            # Prepare input for next iteration
-            next_input = create_input_tensor(word, word_dictionary)
-            output, hidden = model(next_input[0:1].to(device), hidden)
-    
-    return output_sentence.strip()
+    try:
+        # Download and prepare data
+        logger.info("Downloading cryptocurrency data...")
+        data = predictor.download_crypto_data(years=5)
+        if data is None:
+            logger.error("Failed to download data")
+            return
+        
+        # Prepare data
+        logger.info("Preparing data for training...")
+        X, y = predictor.prepare_data(data)
+        predictor.X = X  # Store for future predictions
+        
+        # Train model
+        logger.info("Training the model...")
+        model, metrics = predictor.train_model(
+            X, y,
+            optimize_hyperparameters=False,
+            epochs=100,
+            batch_size=32
+        )
+        
+        # Print metrics
+        print("\nModel Performance Metrics:")
+        for metric, value in metrics.items():
+            print(f"{metric}: {value:.2f}")
+        
+        # Visualize historical predictions
+        logger.info("Generating historical predictions visualization...")
+        y_pred = model.predict(X, verbose=0)
+        predictor.visualize_predictions(y, y_pred)
+        
+        # Make future predictions
+        logger.info("Generating future price predictions...")
+        future_prices = predictor.predict_future(days=30)
+        print("\nPredicted prices for next 30 days:")
+        for i, price in enumerate(future_prices, 1):
+            print(f"Day {i}: ${price:,.2f}")
 
-def plot_training_curves(training_curves, phases=['train', 'val', 'test'], metrics=['loss']):
-    epochs = list(range(len(training_curves['train_loss'])))
-    for metric in metrics:
-        plt.figure()
-        plt.title(f'Training curves - {metric}')
-        for phase in phases:
-            key = phase+'_'+metric
-            if key in training_curves:
-                plt.plot(epochs, training_curves[key])
-        plt.xlabel('epoch')
-        plt.ylabel(metric)
-        plt.legend(labels=phases)
-        plt.show()
+    except Exception as e:
+        logger.error(f"An error occurred in main: {str(e)}")
+        raise
 
-# Main execution
 if __name__ == "__main__":
-    # Download dataset
-    download_dataset()
-    
-    # Process the data
-    pairs = parse_data("spa.txt")
-    english_sentences = [pair[0] for pair in pairs]
-    random.shuffle(english_sentences)
-    print("Number of English sentences:", len(english_sentences))
-
-    # Split the dataset
-    train_sentences = english_sentences[:1000]
-    val_sentences = english_sentences[1000:2000]
-    test_sentences = english_sentences[2000:3000]
-
-    # Create vocabulary
-    english_dictionary = {}
-    english_list = []
-    add_words_to_dict(english_dictionary, english_list, train_sentences)
-    add_words_to_dict(english_dictionary, english_list, val_sentences)
-    add_words_to_dict(english_dictionary, english_list, test_sentences)
-
-    # Create tensors
-    train_tensors = [(create_input_tensor(sentence, english_dictionary), 
-                      create_target_tensor(sentence, english_dictionary)) 
-                     for sentence in train_sentences]
-    val_tensors = [(create_input_tensor(sentence, english_dictionary), 
-                    create_target_tensor(sentence, english_dictionary)) 
-                   for sentence in val_sentences]
-    test_tensors = [(create_input_tensor(sentence, english_dictionary), 
-                     create_target_tensor(sentence, english_dictionary)) 
-                    for sentence in test_sentences]
-
-    # Create dataloaders
-    dataloaders = {
-        'train': train_tensors,
-        'val': val_tensors,
-        'test': test_tensors
-    }
-
-    dataset_sizes = {
-        'train': len(train_tensors),
-        'val': len(val_tensors),
-        'test': len(test_tensors)
-    }
-
-    # Model parameters
-    input_size = len(english_dictionary) + 1
-    hidden_size = 256
-    output_size = len(english_dictionary) + 1
-
-    # Initialize model, loss, optimizer
-    lstm = LSTM(input_size, hidden_size, output_size).to(device)
-    criterion = nn.NLLLoss()
-    optimizer = torch.optim.Adam(lstm.parameters(), lr=0.001)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
-
-    # Train the model
-    num_epochs = 25
-    lstm, training_curves = train_lstm(lstm, dataloaders, dataset_sizes, 
-                                     criterion, optimizer, scheduler, num_epochs=num_epochs)
-
-    # Test some predictions
-    test_phrases = ["what is", "my name", "how are", "hi", "choose"]
-    print("\nExample predictions:")
-    for phrase in test_phrases:
-        prediction = predict(lstm, english_dictionary, english_list, phrase)
-        print(f"Input: {phrase}")
-        print(f"Output: {prediction}\n")
-
-    # Plot training curves
-    plot_training_curves(training_curves, phases=['train', 'val', 'test'])
+    main()
